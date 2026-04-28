@@ -282,3 +282,55 @@ proc means data=ttd1_base n mean std median q1 q3 min max;
 run;
 
 
+proc sort data=cohort;           by &id_var; run;
+proc sort data=line1_episode;    by &id_var; run;
+proc sort data=first_other_drug; by &id_var; run;
+
+data ttd1_base;
+    merge cohort(in=a)
+          line1_episode(in=b)
+          first_other_drug;
+    by &id_var;
+    if a and b;
+
+    length event_1l_type $20;
+    format admin_censor_dt switch_2l_dt event_candidate_dt final_dt yymmdd10.;
+
+    admin_censor_dt = &study_end_dt;
+
+    /* 2L switch/add-on:
+       first non-1L drug starts within 1L grace window */
+    switch_2l_dt = .;
+    if not missing(first_other_drug_start) and first_other_drug_start <= line1_disc_dt then
+        switch_2l_dt = first_other_drug_start;
+
+    /* Event candidates: switch/add-on, 1L discontinuation, death */
+    event_candidate_dt = min(switch_2l_dt, line1_disc_dt, &death_dt_var);
+
+    /* Final follow-up date: event vs administrative censoring */
+    final_dt = min(event_candidate_dt, admin_censor_dt);
+
+    /* Event type */
+    if not missing(event_candidate_dt) and event_candidate_dt <= admin_censor_dt then do;
+        if not missing(&death_dt_var) and final_dt = &death_dt_var then event_1l_type = 'DEATH_ON_TX';
+        else if not missing(switch_2l_dt) and final_dt = switch_2l_dt then event_1l_type = 'SWITCH_2L';
+        else if final_dt = line1_disc_dt then event_1l_type = 'DISCONTINUED';
+    end;
+    else event_1l_type = 'ADMIN_CENSOR';
+
+    /* Flags */
+    switch_2l_flag    = (event_1l_type = 'SWITCH_2L');
+    discontinued_flag = (event_1l_type = 'DISCONTINUED');
+    death_on_tx_flag  = (event_1l_type = 'DEATH_ON_TX');
+    admin_censor_flag = (event_1l_type = 'ADMIN_CENSOR');
+
+    /* For KM: event=1, censor=0 */
+    event_1l = (event_1l_type in ('DEATH_ON_TX', 'SWITCH_2L', 'DISCONTINUED'));
+
+    ttd_1l_days = final_dt - &index_dt_var + 1;
+    if ttd_1l_days < 0 then ttd_1l_days = .;
+
+    ttd_1l_months = ttd_1l_days / 30.4375;
+run;
+
+
