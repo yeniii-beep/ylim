@@ -1,0 +1,169 @@
+/*==============================================================
+  2L+ treatment sequence after switch_2l_dt
+  Assumes the following tables already exist:
+  - ttd1_base
+  - chemo_std
+==============================================================*/
+
+/*--------------------------------------------------------------
+  STEP 1. Keep only patients who switched to 2L
+--------------------------------------------------------------*/
+data line2_start_base;
+    set ttd1_base;
+    where switch_2l_flag = 1;
+    keep &id_var switch_2l_dt;
+    format switch_2l_dt yymmdd10.;
+run;
+
+/*--------------------------------------------------------------
+  STEP 2. Pull all chemo claims on/after 2L start
+--------------------------------------------------------------*/
+proc sql;
+    create table post_2l_claims as
+    select a.&id_var,
+           b.switch_2l_dt,
+           a.rx_start,
+           a.rx_end,
+           a.drug_cd_char
+    from chemo_std as a
+         inner join line2_start_base as b
+         on a.&id_var = b.&id_var
+    where a.rx_start >= b.switch_2l_dt
+    order by a.&id_var, a.rx_start, a.drug_cd_char
+    ;
+quit;
+
+/*--------------------------------------------------------------
+  STEP 3. Optional: add simple drug name label
+  - Replace/add mappings if you know more drug codes
+--------------------------------------------------------------*/
+data post_2l_claims_labeled;
+    set post_2l_claims;
+
+    length drug_nm $40;
+
+    if drug_cd_char = '6562' then drug_nm = 'ALECTINIB';
+    else if drug_cd_char = '6757' then drug_nm = 'BRIGATINIB';
+    /* add more mappings here if needed */
+    else drug_nm = cats('CODE_', drug_cd_char);
+run;
+
+/*--------------------------------------------------------------
+  STEP 4. Build same-day regimen signature
+  - If multiple drugs were prescribed on the same date,
+    combine them as A+B
+--------------------------------------------------------------*/
+proc sort data=post_2l_claims_labeled;
+    by &id_var rx_start drug_cd_char;
+run;
+
+data day_regimen;
+    set post_2l_claims_labeled;
+    by &id_var rx_start;
+
+    length regimen_cd_day $300 regimen_nm_day $500;
+    retain regimen_cd_day regimen_nm_day prev_cd;
+
+    if first.rx_start then do;
+        regimen_cd_day = drug_cd_char;
+        regimen_nm_day = drug_nm;
+        prev_cd = drug_cd_char;
+    end;
+    else do;
+        /* avoid duplicate same code on same day */
+        if drug_cd_char ne prev_cd then do;
+            regimen_cd_day = catx('+', regimen_cd_day, drug_cd_char);
+            regimen_nm_day = catx('+', regimen_nm_day, drug_nm);
+        end;
+        prev_cd = drug_cd_char;
+    end;
+
+    if last.rx_start then output;
+
+    keep &id_var rx_start regimen_cd_day regimen_nm_day;
+    format rx_start yymmdd10.;
+run;
+
+/*--------------------------------------------------------------
+  STEP 5. Build arrow sequence across dates
+  - sequence_all_cd : every regimen date kept
+  - sequence_all_nm : same but labeled
+  - sequence_collapse_cd : consecutive identical regimens collapsed
+  - sequence_collapse_nm : consecutive identical regimens collapsed
+--------------------------------------------------------------*/
+proc sort data=day_regimen;
+    by &id_var rx_start;
+run;
+
+data tx_sequence_2l;
+    set day_regimen;
+    by &id_var rx_start;
+
+    length sequence_all_cd sequence_all_nm $4000
+           sequence_collapse_cd sequence_collapse_nm $4000
+           prev_regimen_cd prev_regimen_nm $500;
+
+    retain sequence_all_cd sequence_all_nm
+           sequence_collapse_cd sequence_collapse_nm
+           prev_regimen_cd prev_regimen_nm first_2l_date last_2l_date n_regimen_days;
+
+    format first_2l_date last_2l_date yymmdd10.;
+
+    if first.&id_var then do;
+        sequence_all_cd = regimen_cd_day;
+        sequence_all_nm = regimen_nm_day;
+
+        sequence_collapse_cd = regimen_cd_day;
+        sequence_collapse_nm = regimen_nm_day;
+
+        prev_regimen_cd = regimen_cd_day;
+        prev_regimen_nm = regimen_nm_day;
+
+        first_2l_date = rx_start;
+        last_2l_date  = rx_start;
+        n_regimen_days = 1;
+    end;
+    else do;
+        sequence_all_cd = catx(' -> ', sequence_all_cd, regimen_cd_day);
+        sequence_all_nm = catx(' -> ', sequence_all_nm, regimen_nm_day);
+
+        if regimen_cd_day ne prev_regimen_cd then do;
+            sequence_collapse_cd = catx(' -> ', sequence_collapse_cd, regimen_cd_day);
+            sequence_collapse_nm = catx(' -> ', sequence_collapse_nm, regimen_nm_day);
+        end;
+
+        prev_regimen_cd = regimen_cd_day;
+        prev_regimen_nm = regimen_nm_day;
+        last_2l_date    = rx_start;
+        n_regimen_days + 1;
+    end;
+
+    if last.&id_var then output;
+
+    keep &id_var first_2l_date last_2l_date n_regimen_days
+         sequence_all_cd sequence_all_nm
+         sequence_collapse_cd sequence_collapse_nm;
+run;
+
+/*--------------------------------------------------------------
+  STEP 6. Attach back to 1L result table if needed
+--------------------------------------------------------------*/
+proc sort data=ttd1_base;       by &id_var; run;
+proc sort data=tx_sequence_2l;  by &id_var; run;
+
+data ttd1_with_2l_sequence;
+    merge ttd1_base(in=a)
+          tx_sequence_2l;
+    by &id_var;
+    if a;
+run;
+
+/*--------------------------------------------------------------
+  STEP 7. QC print
+--------------------------------------------------------------*/
+proc print data=ttd1_with_2l_sequence(obs=50);
+    var &id_var line1_drug_nm switch_2l_flag switch_2l_dt
+        first_2l_date last_2l_date n_regimen_days
+        sequence_all_cd sequence_collapse_cd
+        sequence_all_nm sequence_collapse_nm;
+run;
