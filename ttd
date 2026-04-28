@@ -1,0 +1,381 @@
+options mprint mlogic symbolgen;
+
+/*==============================================================
+  SETTINGS
+==============================================================*/
+%let cohort_ds          = ANALYSIS.POP_FINAL;
+%let chemo_ds           = POP.CHEMO_ALL_FINAL;
+
+%let id_var             = INDI_DSCM_NO;
+%let index_dt_var       = INDEX_DATE;
+%let line1_cd_var       = LINE1_DRUG_CODE;   /* char: '6562' or '6757' */
+%let death_dt_var       = DEATH_DATE;
+
+%let drug_cd_var        = DRUG_CODE;         /* char in chemo table */
+%let rx_dt_var          = RX_DATE;
+%let days_var           = DAYS_SUPPLY;
+%let end_dt_var         = ;
+
+%let grace_days         = 60;
+%let inactivity_days    = 180;
+%let study_end_dt       = '31DEC2023'd;
+
+/*==============================================================
+  STEP 1. Build base cohort
+==============================================================*/
+data cohort;
+    set &cohort_ds;
+
+    keep &id_var &index_dt_var &line1_cd_var &death_dt_var
+         line1_drug_cd line1_drug_nm;
+
+    length line1_drug_cd $20 line1_drug_nm $12;
+
+    line1_drug_cd = strip(&line1_cd_var);
+
+    if line1_drug_cd = '6562' then line1_drug_nm = 'ALECTINIB';
+    else if line1_drug_cd = '6757' then line1_drug_nm = 'BRIGATINIB';
+    else line1_drug_nm = 'UNKNOWN';
+
+    format &index_dt_var &death_dt_var yymmdd10.;
+run;
+
+/*==============================================================
+  STEP 2. Pull all chemo records for cohort
+==============================================================*/
+proc sql;
+    create table chemo_raw as
+    select a.*, 
+           b.&index_dt_var,
+           b.&death_dt_var,
+           b.line1_drug_cd,
+           b.line1_drug_nm
+    from &chemo_ds as a
+         inner join cohort as b
+         on a.&id_var = b.&id_var
+    ;
+quit;
+
+/*==============================================================
+  STEP 3. Standardize chemo dates and define whether each record
+          is the same drug as the known 1L drug
+==============================================================*/
+data chemo_std;
+    set chemo_raw;
+
+    length drug_cd_char $20 drug_nm $12;
+    format rx_start rx_end yymmdd10.;
+
+    drug_cd_char = strip(&drug_cd_var);
+    rx_start     = &rx_dt_var;
+
+    %if %length(&end_dt_var) > 0 %then %do;
+        rx_end = &end_dt_var;
+    %end;
+    %else %do;
+        rx_end = &rx_dt_var + max(&days_var, 1) - 1;
+    %end;
+
+    if drug_cd_char = '6562' then drug_nm = 'ALECTINIB';
+    else if drug_cd_char = '6757' then drug_nm = 'BRIGATINIB';
+    else drug_nm = 'OTHER';
+
+    /* post-index only */
+    if rx_start < &index_dt_var then delete;
+
+    /* whether this record belongs to the subject's predefined 1L drug */
+    if drug_cd_char = line1_drug_cd then is_line1_drug = 1;
+    else is_line1_drug = 0;
+run;
+
+/*==============================================================
+  STEP 4. Build continuous 1L treatment episode
+  - line1_cov_end: last covered date of 1L treatment
+  - line1_disc_dt: discontinuation date after 60-day grace
+==============================================================*/
+proc sort data=chemo_std out=line1_claims;
+    by &id_var rx_start rx_end;
+    where is_line1_drug = 1;
+run;
+
+data line1_episode;
+    set line1_claims;
+    by &id_var;
+
+    retain line1_start line1_cov_end prev_end done;
+    format line1_start line1_cov_end prev_end line1_disc_dt yymmdd10.;
+
+    if first.&id_var then do;
+        line1_start   = rx_start;
+        line1_cov_end = rx_end;
+        prev_end      = rx_end;
+        done          = 0;
+    end;
+    else if done = 0 then do;
+        if rx_start <= prev_end + &grace_days then do;
+            line1_cov_end = max(line1_cov_end, rx_end);
+            prev_end      = max(prev_end, rx_end);
+        end;
+        else do;
+            done = 1;
+            line1_disc_dt = line1_cov_end + &grace_days;
+            output;
+        end;
+    end;
+
+    if last.&id_var and done = 0 then do;
+        line1_disc_dt = line1_cov_end + &grace_days;
+        output;
+    end;
+
+    keep &id_var line1_start line1_cov_end line1_disc_dt;
+run;
+
+/*==============================================================
+  STEP 5. Find first different drug after index date
+  - candidate for switch/add-on and 2L start
+==============================================================*/
+proc sort data=chemo_std out=other_drug_all;
+    by &id_var rx_start rx_end drug_cd_char;
+    where is_line1_drug = 0;
+run;
+
+data first_other_drug;
+    set other_drug_all;
+    by &id_var rx_start rx_end drug_cd_char;
+
+    if first.&id_var;
+
+    length line2_drug_cd $20 line2_drug_nm $20;
+    line2_drug_cd   = drug_cd_char;
+    line2_start     = rx_start;
+    line2_start_end = rx_end;
+
+    if line2_drug_cd = '6562' then line2_drug_nm = 'ALECTINIB';
+    else if line2_drug_cd = '6757' then line2_drug_nm = 'BRIGATINIB';
+    else line2_drug_nm = cats('CODE_', line2_drug_cd);
+
+    format line2_start line2_start_end yymmdd10.;
+    keep &id_var line2_drug_cd line2_drug_nm line2_start line2_start_end;
+run;
+
+/*==============================================================
+  STEP 6. Define last observed follow-up date
+  NOTE:
+  best practice is any healthcare claim date.
+  Here this uses anti-cancer drug claims only.
+==============================================================*/
+proc sql;
+    create table last_claim as
+    select &id_var,
+           max(rx_end) as last_claim_dt format=yymmdd10.
+    from chemo_std
+    group by &id_var
+    ;
+quit;
+
+/*==============================================================
+  STEP 7. Determine 1L event / censoring / TTD
+  Event candidates:
+  1) discontinuation of 1L
+  2) switch/add-on to another drug
+  3) death
+  Censoring:
+  1) study end
+  2) inactivity window after last claim
+==============================================================*/
+proc sort data=cohort;           by &id_var; run;
+proc sort data=line1_episode;    by &id_var; run;
+proc sort data=first_other_drug; by &id_var; run;
+proc sort data=last_claim;       by &id_var; run;
+
+data ttd1_base;
+    merge cohort(in=a)
+          line1_episode(in=b)
+          first_other_drug
+          last_claim;
+    by &id_var;
+    if a and b;
+
+    length event_1l_type $20;
+    format inactivity_dt censor_dt swadd_dt event_1l_dt yymmdd10.;
+
+    inactivity_dt = last_claim_dt + &inactivity_days;
+    censor_dt     = min(&study_end_dt, inactivity_dt);
+
+    /* first different drug is considered 2L only if it starts
+       within the 1L grace window */
+    swadd_dt = .;
+    if not missing(line2_start) and line2_start <= line1_disc_dt then swadd_dt = line2_start;
+
+    event_1l_dt = min(line1_disc_dt, swadd_dt, &death_dt_var, censor_dt);
+
+    /* priority on same day: DEATH > SWITCH_ADDON > DISCONTINUED > CENSORED */
+    if not missing(&death_dt_var) and event_1l_dt = &death_dt_var and &death_dt_var <= censor_dt then event_1l_type = 'DEATH';
+    else if not missing(swadd_dt) and event_1l_dt = swadd_dt and swadd_dt <= censor_dt then event_1l_type = 'SWITCH_ADDON';
+    else if event_1l_dt = line1_disc_dt and line1_disc_dt <= censor_dt then event_1l_type = 'DISCONTINUED';
+    else event_1l_type = 'CENSORED';
+
+    ttd_1l = event_1l_dt - &index_dt_var + 1;
+    if ttd_1l < 0 then ttd_1l = .;
+run;
+
+/*==============================================================
+  STEP 8. Define 2L cohort
+  - only subjects with 1L event = switch/add-on
+==============================================================*/
+data line2_cohort;
+    set ttd1_base;
+    if event_1l_type = 'SWITCH_ADDON';
+run;
+
+/*==============================================================
+  STEP 9. Build continuous 2L episode using the first new drug
+==============================================================*/
+proc sql;
+    create table line2_claims as
+    select a.*,
+           b.line2_start,
+           b.line2_drug_cd,
+           b.line2_drug_nm,
+           b.&death_dt_var,
+           b.censor_dt
+    from chemo_std as a
+         inner join line2_cohort as b
+         on a.&id_var = b.&id_var
+    where strip(a.drug_cd_char) = strip(b.line2_drug_cd)
+      and a.rx_start >= b.line2_start
+    ;
+quit;
+
+proc sort data=line2_claims;
+    by &id_var rx_start rx_end;
+run;
+
+data line2_episode;
+    set line2_claims;
+    by &id_var;
+
+    retain line2_cov_end prev_end done;
+    format line2_cov_end prev_end line2_disc_dt yymmdd10.;
+
+    if first.&id_var then do;
+        line2_cov_end = rx_end;
+        prev_end      = rx_end;
+        done          = 0;
+    end;
+    else if done = 0 then do;
+        if rx_start <= prev_end + &grace_days then do;
+            line2_cov_end = max(line2_cov_end, rx_end);
+            prev_end      = max(prev_end, rx_end);
+        end;
+        else do;
+            done = 1;
+            line2_disc_dt = line2_cov_end + &grace_days;
+            output;
+        end;
+    end;
+
+    if last.&id_var and done = 0 then do;
+        line2_disc_dt = line2_cov_end + &grace_days;
+        output;
+    end;
+
+    keep &id_var line2_cov_end line2_disc_dt;
+run;
+
+/*==============================================================
+  STEP 10. Find first different drug after 2L start
+  - candidate 3L / next switch
+==============================================================*/
+proc sql;
+    create table line3_candidate_all as
+    select a.&id_var,
+           a.rx_start,
+           a.rx_end,
+           a.drug_cd_char as line3_drug_cd
+    from chemo_std as a
+         inner join line2_cohort as b
+         on a.&id_var = b.&id_var
+    where a.rx_start >= b.line2_start
+      and strip(a.drug_cd_char) ne strip(b.line2_drug_cd)
+    ;
+quit;
+
+proc sort data=line3_candidate_all;
+    by &id_var rx_start rx_end line3_drug_cd;
+run;
+
+data first_line3;
+    set line3_candidate_all;
+    by &id_var rx_start rx_end line3_drug_cd;
+
+    if first.&id_var;
+
+    line3_start = rx_start;
+    format line3_start yymmdd10.;
+    keep &id_var line3_drug_cd line3_start;
+run;
+
+/*==============================================================
+  STEP 11. Determine 2L event / censoring / TTD
+==============================================================*/
+proc sort data=line2_cohort;  by &id_var; run;
+proc sort data=line2_episode; by &id_var; run;
+proc sort data=first_line3;   by &id_var; run;
+
+data ttd2_final;
+    merge line2_cohort(in=a)
+          line2_episode(in=b)
+          first_line3;
+    by &id_var;
+    if a and b;
+
+    length event_2l_type $20;
+    format event_2l_dt yymmdd10.;
+
+    event_2l_dt = min(line2_disc_dt, line3_start, &death_dt_var, censor_dt);
+
+    if not missing(&death_dt_var) and event_2l_dt = &death_dt_var and &death_dt_var <= censor_dt then event_2l_type = 'DEATH';
+    else if not missing(line3_start) and event_2l_dt = line3_start and line3_start <= censor_dt then event_2l_type = 'SWITCH_ADDON';
+    else if event_2l_dt = line2_disc_dt and line2_disc_dt <= censor_dt then event_2l_type = 'DISCONTINUED';
+    else event_2l_type = 'CENSORED';
+
+    ttd_2l = event_2l_dt - line2_start + 1;
+    if ttd_2l < 0 then ttd_2l = .;
+run;
+
+/*==============================================================
+  STEP 12. QC / summary
+==============================================================*/
+proc freq data=ttd1_base;
+    tables line1_drug_nm * event_1l_type / missing;
+run;
+
+proc means data=ttd1_base n mean std median q1 q3 min max;
+    class line1_drug_nm;
+    var ttd_1l;
+run;
+
+proc print data=ttd1_base(obs=50);
+    var &id_var &index_dt_var line1_drug_cd line1_drug_nm
+        line1_start line1_cov_end line1_disc_dt
+        line2_drug_cd line2_drug_nm line2_start
+        &death_dt_var last_claim_dt inactivity_dt censor_dt
+        event_1l_dt event_1l_type ttd_1l;
+run;
+
+proc freq data=ttd2_final;
+    tables event_2l_type / missing;
+run;
+
+proc means data=ttd2_final n mean std median q1 q3 min max;
+    var ttd_2l;
+run;
+
+proc print data=ttd2_final(obs=50);
+    var &id_var line2_drug_cd line2_drug_nm line2_start
+        line2_cov_end line2_disc_dt
+        line3_drug_cd line3_start
+        &death_dt_var censor_dt event_2l_dt event_2l_type ttd_2l;
+run;
