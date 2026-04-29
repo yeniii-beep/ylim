@@ -1,0 +1,10 @@
+data index_year_dist;
+    set analysis.ttd_ttd1_base;
+    index_dt_sas = input(index_date, yymmdd10.);
+    format index_dt_sas yymmdd10.;
+    index_year = year(index_dt_sas);
+run;
+
+proc freq data=index_year_dist;
+    tables index_year / missing;
+run;
